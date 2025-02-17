@@ -1,0 +1,318 @@
+##########################################################################################
+###################################################################################
+###################################################################################
+
+library(ggplot2)
+library(nlme)
+library(lattice)
+library(OptSig)
+library(mvtnorm)
+library(rootSolve)
+library(gridExtra)
+library(plyr)
+
+# To do
+#1. arxiv link
+#2.
+###setup parameters
+alpha <- 0.05 # significant level
+power <- 0.80 # power
+z_a <-  qnorm(1-alpha/2, mean = 0, sd = 1) # quantile
+z_p <- qnorm(power, mean = 0, sd = 1)
+tau <- 1  # effect size for testing the Average Individual Effect (AIE)
+delta = 1 # effect size for testing the Average Spillover Effect (ASpE)
+n <- c(1, 2, 5, 10) # network size
+ICC <- seq(0.01, 0.99, by=0.01) # intra-class correlation 
+var_y <- 1 # variance of outcome
+var_u <- ICC*var_y # variance of random effect
+var_e <- var_y -var_u # variance of random noise
+
+# ---- conjunctive test
+# ---- alpha_t, why do you deduct 0.8 in the second last line'
+power = function(K, tau, delta, rho_y, p, n, var_y=1, alpha=0.05){
+  # K : number of networks
+  # tau: AIE
+  # delta: ASpE
+  # rho_y: ICC
+  # p: random treatment probability
+  # n: network size
+  # var_y: variance of outcome 
+  # alpha: significant level
+  # function for Conjunctive test, see eq (8) in the paper
+  var_tau <- var_y*(n*(1-p)*(1-rho_y )+(1+rho_y*n))/((n+1)*(1-p)*p) # variance of AIE
+  var_delta <- var_y*((1-p)*(1-rho_y )+n*(1+n*rho_y ))/(n*(n+1)*(1-p)*p) # variance of ASpE
+  var_td <- var_y*(p*(1+n*rho_y)+(1-p)*(n+1)*rho_y)/((n+1)*p*(1-p)) # covariance of AIE and ASpE
+  # 
+  z_a <-  qnorm(1-alpha/2, mean = 0, sd = 1)
+  z_a2 <- qnorm(alpha/2, mean = 0, sd = 1)
+  u_t <- sqrt(K)*tau/sqrt(var_tau)
+  u_d <- sqrt(K)*delta/sqrt(var_delta)
+  corr_td <- var_td/sqrt(var_tau*var_delta)
+  Omega <- matrix(c(1, corr_td, corr_td, 1), 2, 2)
+  intg1 <- pmvnorm(lower=c(z_a,z_a), upper=Inf, mean=c(u_t,u_d), Omega)
+  intg2 <- pmvnorm(lower=c(z_a,-Inf), upper=c(Inf,z_a2), mean=c(u_t,u_d), Omega)
+  intg3 <- pmvnorm(lower=c(-Inf,z_a), upper=c(z_a2,Inf), mean=c(u_t,u_d), Omega)
+  intg4 <- pmvnorm(lower=c(-Inf,-Inf), upper=c(z_a2,z_a2), mean=c(u_t,u_d), Omega)
+  return(intg1 + intg2 + intg3 + intg4 -0.8)
+}
+
+
+
+# now let's create the dataframe for plot: we need RDSD, n total 12 combinations
+# we use df.X to save all K for the different combination of ICC and n
+
+df.X = expand.grid(ICC,n) # expand.grid(ICC,prob_as) # 
+
+
+colnames(df.X ) <- c("ICC", "n") 
+
+# calculate the between group and within group variance
+df.X$var_u = df.X$ICC*var_y 
+df.X$var_e = var_y -df.X$var_u
+
+# rho_y is the outcome ICC
+rho_y = df.X$ICC;
+
+# then calculate the K for different test given different "p" (allocation prob)
+
+# ------------ Scenario: p=0.3
+p = 0.3
+#KD : direct effect
+#KS SPILLOVER 
+#KDS:JOINT (DISJUNCTIVE TEST)
+#KO:OVERALL
+#KDSC: CONJECTIVE TEST
+
+#1.KD: calculate variance of AIE first in eq(5):
+var_tau_1 = (df.X$var_u+df.X$var_e)*(df.X$n*(1-p)*(1-rho_y )+(1+rho_y*df.X$n))/((df.X$n+1)*(1-p)*p) 
+df.X$KD1 =  var_tau_1 *(z_a+z_p)^2/(tau^2) 
+
+#2.KS: calculate variance of ASpE first in eq(6): in the analysis, tau=delta, 
+var_delta_1= (df.X$var_u+df.X$var_e)*((1-p)*(1-rho_y )+df.X$n*(1+df.X$n*rho_y ))/(df.X$n*(df.X$n+1)*(1-p)*p) #(df.X$var_u+var_e)*D4_1/E4
+df.X$KS1= var_delta_1*(z_a+z_p)^2/(delta^2) 
+
+
+#3.KDS: calculate the K of JOINT (DISJUNCTIVE TEST) using eq(7):
+v=9.633  #qchisq(0.95, 2, lower.tail = TRUE, log.p = FALSE) [1] 5.991465
+# tau=delta, so here I 
+df.X$KDS1=(v*(df.X$var_u+df.X$var_e)*(1+df.X$n*rho_y))/((1-p)*p*(tau^2 +df.X$n*(delta^2)))
+
+#4. calculate K for overall effect in eq(9):
+var_O_1 = (df.X$var_u+df.X$var_e)*(1+df.X$n*rho_y)*(1+df.X$n)/((1-p)*p) # 
+df.X$KO1 =  var_O_1 *(z_a+z_p)^2/(tau+df.X$n*delta)^2 
+
+#5: calculate the K for the Conjunctive test eq(8) uisng power function at the beginning:
+df.X$KDSC1 =  0
+
+# ------- is this power function monotonous?
+# -------- how do we set up the end for search range, is it necessary?
+# -------- wanrnings in this multiroot function 
+
+for(i in 1:396){
+  df.X$KDSC1[i] = multiroot(power,start=1, positive = TRUE,
+                            tau=1,delta=1,rho_y=rho_y[i],p= 0.3,n=df.X$n[i],
+                            maxiter = 500)$root
+  print(i)
+  
+}
+
+
+# ------ Scenario: p = 0.5 
+######Below is basiclly the same code as before but with different "p"
+
+p = 0.5
+#1.
+var_tau_2 = (df.X$var_u+df.X$var_e)*(df.X$n*(1-p)*(1-rho_y )+(1+rho_y*df.X$n))/((df.X$n+1)*(1-p)*p) 
+df.X$KD2 =  var_tau_2 *(z_a+z_p)^2/(tau^2) 
+
+#2.
+var_delta_2= (df.X$var_u+df.X$var_e)*((1-p)*(1-rho_y )+df.X$n*(1+df.X$n*rho_y ))/(df.X$n*(df.X$n+1)*(1-p)*p)
+df.X$KS2= var_delta_2*(z_a+z_p)^2/(delta^2) 
+
+#3.
+v=9.633  #qchisq(0.95, 2, lower.tail = TRUE, log.p = FALSE) [1] 5.991465
+df.X$KDS2=(v*(df.X$var_u+df.X$var_e)*(1+df.X$n*rho_y))/((1-p)*p*(tau^2 +df.X$n*delta^2))
+
+#4.
+var_O_2 = (df.X$var_u+df.X$var_e)*(1+df.X$n*rho_y)*(1+df.X$n)/((1-p)*p) #
+df.X$KO2 =  var_O_2 *(z_a+z_p)^2/(tau+df.X$n*delta)^2 
+
+#5.
+df.X$KDSC2 =  0
+
+for(i in 1:396){
+  df.X$KDSC2[i] = multiroot(power,start=1, positive = TRUE,
+                            tau=1,delta=1,rho_y=rho_y[i],p= 0.5,n=df.X$n[i],
+                            maxiter = 500)$root
+  print(i)
+}
+
+
+#1.
+var_tau_3 = (df.X$var_u+df.X$var_e)*(df.X$n*(1-p)*(1-rho_y )+(1+rho_y*df.X$n))/((df.X$n+1)*(1-p)*p) # 
+df.X$KD3 =  var_tau_3 *(z_a+z_p)^2/(tau^2) 
+#2.
+var_delta_3= (df.X$var_u+df.X$var_e)*((1-p)*(1-rho_y )+df.X$n*(1+df.X$n*rho_y ))/(df.X$n*(df.X$n+1)*(1-p)*p) 
+df.X$KS3= var_delta_3*(z_a+z_p)^2/(delta^2) 
+
+#3.
+v=9.633  #qchisq(0.95, 2, lower.tail = TRUE, log.p = FALSE) [1] 5.991465
+df.X$KDS3=(v*(df.X$var_u+df.X$var_e)*(1+df.X$n*rho_y))/((1-p)*p*(tau^2 +df.X$n*delta^2))
+
+#4.
+var_O_3 = (df.X$var_u+df.X$var_e)*(1+df.X$n*rho_y)*(1+df.X$n)/((1-p)*p) # (df.X$var_u+var_e)*A4/E4
+df.X$KO3 =  var_O_3 *(z_a+z_p)^2/(tau+df.X$n*delta)^2 
+
+#5.
+df.X$KDSC3 =  0
+for(i in 1:396){
+  df.X$KDSC3[i] = multiroot(power,start=1, positive = TRUE,
+                            tau=1,delta=1,rho_y=rho_y[i],p= 0.7,n=df.X$n[i],
+                            maxiter = 500)$root
+  print(i)
+  
+}
+
+# --------- Scenario: p=0.9
+p = 0.9
+#1.
+var_tau_4 = (df.X$var_u+df.X$var_e)*(df.X$n*(1-p)*(1-rho_y )+(1+rho_y*df.X$n))/((df.X$n+1)*(1-p)*p) 
+df.X$KD4 =  var_tau_4 *(z_a+z_p)^2/(tau^2) 
+
+#2.
+var_delta_4= (df.X$var_u+df.X$var_e)*((1-p)*(1-rho_y )+df.X$n*(1+df.X$n*rho_y ))/(df.X$n*(df.X$n+1)*(1-p)*p) 
+df.X$KS4= var_delta_4*(z_a+z_p)^2/(delta^2) 
+
+#3.
+v=9.633  #qchisq(0.95, 2, lower.tail = TRUE, log.p = FALSE) [1] 5.991465
+df.X$KDS4=(v*(df.X$var_u+df.X$var_e)*(1+df.X$n*rho_y))/((1-p)*p*(tau^2 +df.X$n*delta^2))
+
+#4.
+var_O_4 = (df.X$var_u+df.X$var_e)*(1+df.X$n*rho_y)*(1+df.X$n)/((1-p)*p) 
+df.X$KO4 =  var_O_4 *(z_a+z_p)^2/(tau+df.X$n*delta)^2 
+
+#5.
+df.X$KDSC4 =  0
+for(i in 1:396){
+  df.X$KDSC4[i] = multiroot(power,start=1, positive = TRUE,
+                            tau=1,delta=1,rho_y=rho_y[i],p= 0.9,n=df.X$n[i],
+                            maxiter = 500)$root
+  print(i)
+  
+}
+
+
+
+
+
+
+### below is the code to draw the plot in the maintext
+n.labs <- c("n=1", "n=2", "n=5",  "n=10")
+names(n.labs) <- c("1", "2", "5","10")
+
+
+
+#data =df.X[df.X$KDSC1>0],
+# change df.X ==0 to NA
+df.X[df.X==0]<-NA
+
+p1<-ggplot(df.X,aes(x=ICC)) +facet_wrap( ~ n, nrow = 1, labeller = labeller(n = n.labs))+ 
+  ylab("required number network K")+ xlab(expression(rho[Y]))+
+  geom_line(aes(y = KD1), color = "#cc0000") + 
+  geom_line(aes(y = KS1), color = "#0073e6") + 
+  geom_line(aes(y =KDS1), color="black") +
+  geom_line(aes(y =KO1), color="green") +
+  # geom_line(data =as.data.frame(df.X$KDSC1[df.X$KDSC1>0]), aes(y =KDSC1), color="orange") +
+  geom_line( aes(y =KDSC1), color="orange") +
+  theme(plot.title = element_text(hjust = 0.5))+
+  ggtitle(expression(paste("(a) p=0.3")))+ylim(0, 50)
+p1
+
+
+
+
+p2<-ggplot(df.X, aes(x=ICC)) +facet_wrap( ~ n, nrow = 1, labeller = labeller(n = n.labs))+
+  ylab("required number network K")+ xlab(expression(rho[Y]))+
+  geom_line(aes(y = KD2), color = "#cc0000") + 
+  geom_line(aes(y = KS2), color = "#0073e6") + 
+  geom_line(aes(y =KDS2), color="black") +
+  geom_line(aes(y =KO2), color="green") +
+  geom_line( aes(y =KDSC2), color="orange") +
+  theme(plot.title = element_text(hjust = 0.5))+
+  ggtitle(expression(paste("(b) p=0.5")))+ylim(0, 50)
+#p2
+
+
+p3<-ggplot(df.X, aes(x=ICC)) +facet_wrap( ~ n, nrow = 1, labeller = labeller(n = n.labs))+
+  ylab("required number network K")+ xlab(expression(rho[Y]))+
+  geom_line(aes(y = KD3), color = "#cc0000") + 
+  geom_line(aes(y = KS3), color = "#0073e6") + 
+  geom_line(aes(y =KDS3), color="black") +
+  geom_line(aes(y =KO3), color="green") +
+  geom_line( aes(y =KDSC3), color="orange") +
+  theme(plot.title = element_text(hjust = 0.5))+
+  ggtitle(expression(paste("(c) p=0.7")))+ylim(0, 50)
+#p3
+
+
+
+p4<-ggplot(df.X, aes(x=ICC)) +facet_wrap( ~ n, nrow = 1, labeller = labeller(n = n.labs))+ 
+  ylab("required number network K")+ xlab(expression(rho[Y]))+
+  geom_line(aes(y = KD4,color = "tau"  )) + 
+  geom_line(aes(y = KS4, color = "delta" )) + 
+  geom_line(aes(y =KDS4, color="joint" )) +
+  geom_line(aes(y =KDSC4, color="conjunctive" )) +
+  geom_line(aes(y =KO4, color="O")) +
+  scale_color_manual(values = c(
+    "tau" = '#cc0000',
+    "delta" = 'blue',
+    "joint" = "black" ,
+    "conjunctive" = "orange",
+    "O" = "green"),
+    labels = c( expression(tau),expression(delta),"Joint","Conjunctive","Overall")
+  )+
+  labs(color = 'K for testing')+
+  theme(legend.position = "bottom",plot.title = element_text(hjust = 0.5))+
+  ggtitle(expression(paste("(d) p =0.9")))+ylim(0,120)
+#p4
+
+# expression(paste("(",tau,",",delta,')')
+
+
+g_legend<-function(a.gplot){
+  tmp <- ggplot_gtable(ggplot_build(a.gplot))
+  leg <- which(sapply(tmp$grobs, function(x) x$name) == "guide-box")
+  legend <- tmp$grobs[[leg]]
+  return(legend)}
+
+mylegend<-g_legend(p4)
+
+
+#p5 <-grid.arrange(p1, p2,p3,p4, nrow = 4,
+#            top =expression(paste('Required network number using Single Regression Model when ',Delta[tau],'=',Delta[delta], '=1')))
+
+p5 <- grid.arrange(arrangeGrob(p1 + theme(legend.position="none"),
+                               p2 + theme(legend.position="none"),
+                               p3 + theme(legend.position="none"),
+                               p4 + theme(legend.position="none"),
+                               nrow=4),
+                   mylegend, nrow=2,heights=c(15, 1))
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
